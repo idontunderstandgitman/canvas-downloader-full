@@ -37,13 +37,17 @@ uv run canvas-dl --url canvas.myschool.edu --out ~/Downloads/Canvas --workers 4
   pages/            wiki pages as HTML
   assignments/      descriptions as HTML (+ your own submission attachments)
   announcements/  discussions/  Syllabus.html
-  media/            Canvas media objects (uploaded/recorded videos)
+  media/            Canvas media objects and Canvas Studio videos (uploaded/recorded videos)
+  linked_pages/     pages from other courses that this course links to (e.g. shared recordings)
   linked_files/     files linked from page/assignment HTML that weren't found elsewhere
   _download_log.txt anything locked, missing, or failed
 ```
 
 ## Notes
 
-- "Canvas-hosted videos" means video files and Canvas media objects. Videos in external tools
-  (Panopto, Kaltura, YuJa, YouTube, Canvas Studio) aren't downloaded; their links appear in `_module.md`.
+- "Canvas-hosted videos" means video files, Canvas media objects, and Canvas Studio (`*.instructuremedia.com`)
+  embeds, downloaded in the best available quality. Videos in other external tools
+  (Panopto, Kaltura, YuJa, YouTube) aren't downloaded; their links appear in `_module.md`.
+- Links to pages in other courses are followed a few hops (if your account can see them), so
+  material a teacher keeps in an older course instance is included.
 - Only content your account can see is downloaded.

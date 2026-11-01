@@ -11,7 +11,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 
 from rich.console import Console
 from rich.progress import (
@@ -33,6 +33,15 @@ VIDEO_EXT = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".wmv", ".flv", ".
 FILE_RE = re.compile(r"/files/(\d+)")
 MEDIA_ATTACHMENT_RE = re.compile(r"media_attachments_iframe/(\d+)")
 MEDIA_ID_RE = re.compile(r"""(?:media_comment_|data-media-id=["']|media_objects_iframe/)([\w-]+)""")
+PAGE_LINK_RE = re.compile(r"""/courses/(\d+)/pages/([^"'?#<>\s&]+)""")
+LTI_LINK_RE = re.compile(r"""(?:src|href)=["']([^"']*/external_tools/retrieve\?[^"']*)["']""")
+FORM_RE = re.compile(r"<form[^>]*?action=\"([^\"]+)\"[^>]*>(.*?)</form>", re.S)
+INPUT_RE = re.compile(r"<input\b[^>]*>", re.S)
+ATTR_RE = re.compile(r"""\b(name|value)=["']([^"']*)["']""")
+YOUTUBE_RE = re.compile(
+    r"""(?:youtube(?:-nocookie)?\.com/(?:watch\?(?:[^"'<>\s]*?&(?:amp;)?)?v=|embed/|shorts/|live/|v/)|youtu\.be/)([\w-]{11})"""
+)
+PAGE_LINK_HOPS = 3  # how far to follow links to pages (incl. other courses' pages)
 
 HTML_TEMPLATE = """<!doctype html>
 <html><head><meta charset="utf-8"><title>{title}</title><base href="{base}/">
@@ -114,7 +123,10 @@ class CourseDownloader:
         self.jobs: list[Job] = []
         self.file_paths: dict[int, Path | None] = {}  # file id -> destination (None = skipped)
         self.claimed: set[Path] = set()
-        self.saved_pages: dict[str, Path | None] = {}
+        self.saved_pages: dict[tuple[int, str], Path | None] = {}
+        self.linked_pages: set[tuple[int, str]] = set()
+        self.studio_embeds: dict[str, tuple[str, str]] = {}  # Studio media id -> (Canvas launch URL, context)
+        self.youtube: dict[str, list[str]] = {}  # YouTube video id -> where it was linked from
         self.linked_files: set[int] = set()
         self.linked_media: set[str] = set()
         self.done_media: set[str] = set()
@@ -185,13 +197,32 @@ class CourseDownloader:
         dest.write_text(
             HTML_TEMPLATE.format(title=html.escape(title), base=self.api.base, body=body or ""), encoding="utf-8"
         )
-        self.scan_html(body or "")
+        self.scan_html(body or "", title)
         return dest
 
-    def scan_html(self, body: str) -> None:
+    def scan_html(self, body: str, context: str = "") -> None:
         self.linked_files.update(int(m) for m in FILE_RE.findall(body))
         self.linked_files.update(int(m) for m in MEDIA_ATTACHMENT_RE.findall(body))
         self.linked_media.update(MEDIA_ID_RE.findall(body))
+        self.linked_pages.update((int(c), unquote(slug)) for c, slug in PAGE_LINK_RE.findall(body))
+        for link in LTI_LINK_RE.findall(body):
+            self.add_studio_embed(urljoin(self.api.base + "/", html.unescape(link)), context)
+        self.note_youtube(body, context)
+
+    def note_youtube(self, text: str, context: str) -> None:
+        for vid in YOUTUBE_RE.findall(text):
+            seen = self.youtube.setdefault(vid, [])
+            if context and context not in seen:
+                seen.append(context)
+
+    def add_studio_embed(self, launch_url: str, context: str) -> None:
+        """Remember a Canvas Studio (instructuremedia.com) embed, given its Canvas LTI launch URL."""
+        tool_url = (parse_qs(urlparse(launch_url).query).get("url") or [""])[0]
+        if "instructuremedia.com" not in tool_url:
+            return
+        mid = (parse_qs(urlparse(tool_url).query).get("custom_arc_media_id") or [""])[0]
+        if mid:
+            self.studio_embeds.setdefault(mid, (launch_url, context))
 
     # --- crawl steps ---------------------------------------------------------------
     def do_info(self) -> None:
@@ -213,13 +244,20 @@ class CourseDownloader:
                     d = d / safe(part)
             self.queue_file(f, d)
 
-    def save_page(self, slug: str) -> Path | None:
-        if slug not in self.saved_pages:
-            p = self.api_get(self.c(f"/pages/{quote(slug, safe='')}"))
-            self.saved_pages[slug] = (
-                self.save_html(self.root / "pages", p.get("title") or slug, p.get("body"), slug) if p else None
-            )
-        return self.saved_pages[slug]
+    def save_page(self, slug: str, cid: int | None = None) -> Path | None:
+        """Save a wiki page. Pages from other courses (linked from this one) go to linked_pages/."""
+        cid = cid or self.cid
+        key = (cid, unquote(slug))
+        if key not in self.saved_pages:
+            self.saved_pages[key] = None
+            own = cid == self.cid
+            p = self.api_get(f"/api/v1/courses/{cid}/pages/{quote(key[1], safe='')}", quiet=not own)
+            if p:
+                directory = self.root / ("pages" if own else "linked_pages")
+                self.saved_pages[key] = self.save_html(directory, p.get("title") or key[1], p.get("body"), key[1] if own else f"{cid}-{key[1]}")
+            elif not own:
+                self.log(f"linked page not accessible: course {cid} page {key[1]}")
+        return self.saved_pages[key]
 
     def do_pages(self) -> None:
         for p in self.api_list(self.c("/pages")):
@@ -247,6 +285,12 @@ class CourseDownloader:
                     ref = self.rel(self.save_page(it["page_url"]))
                 elif kind in ("ExternalUrl", "ExternalTool"):
                     ref = it.get("external_url") or it.get("html_url", "")
+                    self.note_youtube(ref, f"{m.get('name', '')} / {title}")
+                    if kind == "ExternalTool" and it.get("external_url"):
+                        launch = f"{self.api.base}/courses/{self.cid}/external_tools/retrieve?" + (
+                            f"display=borderless&url={quote(it['external_url'], safe='')}"
+                        )
+                        self.add_studio_embed(launch, title)
                 else:
                     ref = it.get("html_url", "")
                 lines.append(f"{indent}- [{kind}] {title} — {ref}")
@@ -311,6 +355,78 @@ class CourseDownloader:
             return
         for mo in self.api_list(self.c("/media_objects")):
             self.queue_media(mo)
+
+    def do_linked_pages(self) -> None:
+        for _ in range(PAGE_LINK_HOPS):
+            pending = sorted(self.linked_pages - self.saved_pages.keys())
+            if not pending:
+                break
+            for cid, slug in pending:
+                self.save_page(slug, cid)
+
+    def studio_media(self, launch_url: str) -> dict | None:
+        """Run the Canvas -> Studio LTI launch with our session and return Studio's media record."""
+        client = self.api.client
+        r = client.get(launch_url)
+        form = FORM_RE.search(r.text) if r.status_code < 400 else None
+        if not form:
+            return None
+        fields = {}
+        for tag in INPUT_RE.findall(form.group(2)):
+            attrs = dict(ATTR_RE.findall(tag))
+            if "name" in attrs:
+                fields[html.unescape(attrs["name"])] = html.unescape(attrs.get("value", ""))
+        r = client.post(html.unescape(form.group(1)), data=fields)
+        lti_params = parse_qs(r.url.query.decode()).get("lti_params")
+        if r.status_code >= 400 or not lti_params:
+            return None
+        r = client.get(
+            f"{r.url.scheme}://{r.url.host}/api/media_management/lti_media",
+            params={"lti_params": lti_params[0]},
+            headers={"Accept": "application/json"},
+        )
+        return r.json().get("media") if r.status_code < 400 else None
+
+    def do_studio(self) -> None:
+        if not self.include_videos:
+            return
+        for mid, (launch_url, context) in self.studio_embeds.items():
+            try:
+                media = self.studio_media(launch_url)
+            except Exception as e:
+                media = None
+                self.log(f"Canvas Studio media {mid} ({context}) failed: {e!r}")
+            sources = [
+                s for s in (media or {}).get("sources") or []
+                if (s.get("download_url") or s.get("url")) and s.get("status", "succeeded") == "succeeded"
+            ]
+            if not sources:
+                self.log(f"could not resolve Canvas Studio media {mid} ({context})")
+                continue
+            meta = lambda s: s.get("metadata") or {}  # noqa: E731
+            best = max(sources, key=lambda s: (not meta(s).get("is_audio"), _int(meta(s).get("height")), _int(meta(s).get("size"))))
+            ext = mimetypes.guess_extension((best.get("mime_type") or "").split(";")[0]) or ".mp4"
+            title = media.get("title") or mid
+            name = f"{context} - {title}" if context and context != title else title
+            dest = self.claim(self.root / "media", f"{name}{ext}", mid)
+            self.jobs.append(Job(best.get("download_url") or best["url"], dest, meta(best).get("size")))
+
+    def write_youtube_list(self) -> None:
+        """YouTube videos aren't downloaded; list them (with titles when YouTube tells us) in yt-vids.txt."""
+        if not self.youtube:
+            return
+        lines = [f"# YouTube videos linked from {course_dir_name(self.course)} (not downloaded)", ""]
+        for vid, contexts in self.youtube.items():
+            url = f"https://www.youtube.com/watch?v={vid}"
+            try:
+                r = self.api.client.get("https://www.youtube.com/oembed", params={"url": url, "format": "json"}, timeout=15)
+                title = r.json().get("title", "") if r.status_code == 200 else "(unavailable or private)"
+            except Exception:
+                title = ""
+            lines.append(f"{url}  {title}".rstrip())
+            lines += [f"    linked from: {c}" for c in contexts]
+        self.root.mkdir(parents=True, exist_ok=True)
+        (self.root / "yt-vids.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def do_linked(self) -> None:
         for fid in sorted(self.linked_files - self.file_paths.keys()):
@@ -398,7 +514,9 @@ class CourseDownloader:
             ("announcements", self.do_announcements),
             ("discussions", self.do_discussions),
             ("syllabus", self.do_syllabus),
+            ("linked pages", self.do_linked_pages),
             ("media / videos", self.do_media),
+            ("Canvas Studio videos", self.do_studio),
             ("linked files & embedded media", self.do_linked),
         ]
         with self.console.status("") as status:
@@ -411,6 +529,7 @@ class CourseDownloader:
 
         self.console.print(f"Queued [bold]{len(self.jobs)}[/bold] files"
                            + (f", skipped {self.skipped_videos} videos" if self.skipped_videos else ""))
+        self.write_youtube_list()
         failed = self.do_downloads()
 
         if self.log_lines:
