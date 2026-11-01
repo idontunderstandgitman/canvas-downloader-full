@@ -11,7 +11,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlparse
 
 from rich.console import Console
 from rich.progress import (
@@ -33,6 +33,15 @@ VIDEO_EXT = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".wmv", ".flv", ".
 FILE_RE = re.compile(r"/files/(\d+)")
 MEDIA_ATTACHMENT_RE = re.compile(r"media_attachments_iframe/(\d+)")
 MEDIA_ID_RE = re.compile(r"""(?:media_comment_|data-media-id=["']|media_objects_iframe/)([\w-]+)""")
+# Canvas Studio (instructuremedia.com) embeds: an LTI launch iframe through /external_tools/retrieve.
+STUDIO_IFRAME_RE = re.compile(r"<iframe\b[^>]*>", re.I)
+ATTR_RE = re.compile(r"""\b(src|title)\s*=\s*["']([^"']*)["']""", re.I)
+STUDIO_MEDIA_ID_RE = re.compile(r"custom_arc_media_id(?:=|%3D)([\w-]+)")
+FORM_RE = re.compile(r"<form\b[^>]*\baction=[\"']([^\"']+)[\"'][^>]*>(.*?)</form>", re.I | re.S)
+INPUT_RE = re.compile(r"<input\b[^>]*>", re.I)
+INPUT_ATTR_RE = re.compile(r"""\b(name|value)\s*=\s*["']([^"']*)["']""", re.I)
+LINK_RE = re.compile(r"""<a\b[^>]*\bhref=["'](https?://[^"']+)["'][^>]*>(.*?)</a>""", re.I | re.S)
+TAG_RE = re.compile(r"<[^>]+>")
 
 HTML_TEMPLATE = """<!doctype html>
 <html><head><meta charset="utf-8"><title>{title}</title><base href="{base}/">
@@ -64,11 +73,33 @@ def is_video(f: dict) -> bool:
     return ct.startswith("video/") or f.get("mime_class") == "video" or Path(name).suffix.lower() in VIDEO_EXT
 
 
+def video_key(name: str) -> str:
+    """Compare video titles with and without their extension ("Forel-2a_small" == "Forel-2a_small.mp4")."""
+    p = Path(name.strip().lower())
+    return p.stem if p.suffix in VIDEO_EXT else str(p)
+
+
 def _int(v) -> int:
     try:
         return int(v)
     except (TypeError, ValueError):
         return 0
+
+
+def srt_time(t: float) -> str:
+    ms = int(round(float(t) * 1000))
+    h, ms = divmod(ms, 3_600_000)
+    m, ms = divmod(ms, 60_000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def captions_to_srt(sequences: list[dict]) -> str:
+    out = []
+    for i, seq in enumerate(sequences, 1):
+        out.append(f"{i}\n{srt_time(seq.get('start_time', 0))} --> {srt_time(seq.get('end_time', 0))}\n"
+                   f"{(seq.get('text') or '').strip()}\n")
+    return "\n".join(out)
 
 
 def course_dir_name(c: dict) -> str:
@@ -117,6 +148,8 @@ class CourseDownloader:
         self.saved_pages: dict[str, Path | None] = {}
         self.linked_files: set[int] = set()
         self.linked_media: set[str] = set()
+        self.studio_embeds: dict[str, tuple[str, str]] = {}  # Studio media id -> (launch URL, title)
+        self.external_links: dict[str, tuple[str, str]] = {}  # URL -> (link text, page it was on)
         self.done_media: set[str] = set()
         self.queued_video_names: set[str] = set()
         self.skipped_videos = 0
@@ -174,7 +207,7 @@ class CourseDownloader:
         dest = self.claim(directory, name, fid)
         self.file_paths[fid] = dest
         if is_video(f):
-            self.queued_video_names.add(name.lower())
+            self.queued_video_names.add(video_key(name))
         self.jobs.append(Job(url, dest, f.get("size")))
         return dest
 
@@ -185,13 +218,25 @@ class CourseDownloader:
         dest.write_text(
             HTML_TEMPLATE.format(title=html.escape(title), base=self.api.base, body=body or ""), encoding="utf-8"
         )
-        self.scan_html(body or "")
+        self.scan_html(body or "", dest)
         return dest
 
-    def scan_html(self, body: str) -> None:
+    def scan_html(self, body: str, where: Path | None = None) -> None:
         self.linked_files.update(int(m) for m in FILE_RE.findall(body))
         self.linked_files.update(int(m) for m in MEDIA_ATTACHMENT_RE.findall(body))
         self.linked_media.update(MEDIA_ID_RE.findall(body))
+        for tag in STUDIO_IFRAME_RE.findall(body):
+            attrs = {k.lower(): html.unescape(v) for k, v in ATTR_RE.findall(tag)}
+            src = attrs.get("src", "")
+            m = STUDIO_MEDIA_ID_RE.search(src)
+            if m and "instructuremedia" in src:
+                self.studio_embeds.setdefault(m.group(1), (src, attrs.get("title", "")))
+        host = re.sub(r"^https?://", "", self.api.base)
+        for url, text in LINK_RE.findall(body):
+            url = html.unescape(url)
+            if host not in url:
+                text = " ".join(html.unescape(TAG_RE.sub("", text)).split())
+                self.external_links.setdefault(url, (text, self.rel(where) if where else ""))
 
     # --- crawl steps ---------------------------------------------------------------
     def do_info(self) -> None:
@@ -282,8 +327,9 @@ class CourseDownloader:
             return
         self.done_media.add(mid)
         title = mo.get("user_entered_title") or mo.get("title") or mid
-        if title.lower() in self.queued_video_names:
+        if video_key(title) in self.queued_video_names:
             return  # same video already queued as a course file
+        self.queued_video_names.add(video_key(title))
         sources = [s for s in mo.get("media_sources") or [] if s.get("url") or s.get("src")]
         if not sources:
             self.log(f"no downloadable sources for media {mid} ({title})")
@@ -324,6 +370,83 @@ class CourseDownloader:
                 info = self.media_info(mid)
                 if info:
                     self.queue_media(info)
+
+    # --- Canvas Studio ---------------------------------------------------------------
+    def studio_launch(self, launch_url: str) -> tuple[str, str] | None:
+        """Run the LTI launch Canvas would do in the iframe. Returns (Studio origin, lti_params)."""
+        r = self.api.client.get(launch_url)
+        form = FORM_RE.search(r.text) if r.status_code < 400 else None
+        if not form:
+            self.log(f"Studio: no LTI launch form at {launch_url} (HTTP {r.status_code})")
+            return None
+        data = {}
+        for tag in INPUT_RE.findall(form.group(2)):
+            a = {k.lower(): html.unescape(v) for k, v in INPUT_ATTR_RE.findall(tag)}
+            if "name" in a:
+                data[a["name"]] = a.get("value", "")
+        r = self.api.client.post(html.unescape(form.group(1)), data=data)
+        params = parse_qs(urlparse(str(r.url)).query).get("lti_params")
+        if r.status_code >= 400 or not params:
+            self.log(f"Studio: LTI launch failed (HTTP {r.status_code}) for {launch_url}")
+            return None
+        u = urlparse(str(r.url))
+        return f"{u.scheme}://{u.netloc}", params[0]
+
+    def queue_studio(self, mid: str, launch_url: str, embed_title: str) -> None:
+        launch = self.studio_launch(launch_url)
+        if not launch:
+            return
+        origin, lti = launch
+        headers = {"Accept": "application/json", "X-Lti-Params": lti}
+        r = self.api.client.get(f"{origin}/api/media_management/lti_media", params={"lti_params": lti}, headers=headers)
+        media = r.json().get("media") if r.status_code < 400 else None
+        if not media:
+            self.log(f"Studio: could not load media {mid} ({embed_title}): HTTP {r.status_code}")
+            return
+        title = media.get("title") or embed_title or mid
+        if video_key(title) in self.queued_video_names:
+            return  # same video already queued from Canvas files / media objects
+        self.queued_video_names.add(video_key(title))
+        sources = [s for s in media.get("sources") or [] if s.get("download_url") or s.get("url")]
+        if not sources:
+            self.log(f"Studio: no downloadable sources for {title}")
+            return
+        meta = lambda s: s.get("metadata") or {}  # noqa: E731
+        best = max(sources, key=lambda s: (_int(meta(s).get("height")), _int(meta(s).get("bit_rate"))))
+        ext = mimetypes.guess_extension(best.get("mime_type") or "") or ".mp4"
+        name = title if Path(title).suffix.lower() in VIDEO_EXT else f"{title}{ext}"
+        dest = self.claim(self.root / "media", name, mid)
+        self.jobs.append(Job(best.get("download_url") or best["url"], dest, meta(best).get("size")))
+        # Captions: Studio serves them as JSON segments; save them as .srt next to the video.
+        for cap in media.get("captions") or []:
+            if not cap.get("url") or cap.get("is_empty"):
+                continue
+            cr = self.api.client.get(origin + cap["url"], headers=headers)
+            seqs = (cr.json().get("caption_file") or {}).get("sequences") if cr.status_code < 400 else None
+            if seqs:
+                srt = dest.with_name(f"{dest.stem}.{cap.get('srclang') or cap.get('id')}.srt")
+                srt.parent.mkdir(parents=True, exist_ok=True)
+                srt.write_text(captions_to_srt(seqs), encoding="utf-8")
+            else:
+                self.log(f"Studio: caption {cap.get('srclang')} for {title} unavailable (HTTP {cr.status_code})")
+
+    def do_studio(self) -> None:
+        if not self.include_videos:
+            return
+        for mid, (src, title) in sorted(self.studio_embeds.items(), key=lambda kv: kv[1][1]):
+            try:
+                self.queue_studio(mid, src, title)
+            except Exception as e:
+                self.log(f"Studio: {title or mid} failed: {e!r}")
+
+    def do_external_links(self) -> None:
+        """Links to other sites (YouTube, ChatGPT shares, …) can't be downloaded; list them so they aren't lost."""
+        if not self.external_links:
+            return
+        lines = ["# External links", "", "Links in course pages that point outside Canvas. They are not downloaded.", ""]
+        for url, (text, where) in sorted(self.external_links.items(), key=lambda kv: (kv[1][1], kv[0])):
+            lines.append(f"- [{text or url}]({url})" + (f" — {where}" if where else ""))
+        (self.root / "_external_links.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     # --- downloading ---------------------------------------------------------------
     def fetch(self, job: Job, progress: Progress) -> None:
@@ -400,6 +523,8 @@ class CourseDownloader:
             ("syllabus", self.do_syllabus),
             ("media / videos", self.do_media),
             ("linked files & embedded media", self.do_linked),
+            ("Canvas Studio videos", self.do_studio),
+            ("external links", self.do_external_links),
         ]
         with self.console.status("") as status:
             for label, fn in steps:
