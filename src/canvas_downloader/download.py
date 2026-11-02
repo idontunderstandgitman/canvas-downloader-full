@@ -292,6 +292,12 @@ class CourseDownloader:
                     ref = self.rel(self.save_page(it["page_url"]))
                 elif kind in ("ExternalUrl", "ExternalTool"):
                     ref = it.get("external_url") or it.get("html_url", "")
+                    m = STUDIO_MEDIA_ID_RE.search(ref)
+                    if kind == "ExternalTool" and m and "instructuremedia" in ref:
+                        # Studio video added as a module item: launch it the way an embed iframe would.
+                        launch = (f"{self.api.base}/courses/{self.cid}/external_tools/retrieve"
+                                  f"?display=borderless&url={quote(ref, safe='')}")
+                        self.studio_embeds.setdefault(m.group(1), (launch, title))
                 else:
                     ref = it.get("html_url", "")
                 lines.append(f"{indent}- [{kind}] {title} — {ref}")

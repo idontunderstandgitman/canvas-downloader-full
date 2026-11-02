@@ -46,7 +46,7 @@ uv run canvas-dl --url canvas.myschool.edu --out ~/Downloads/Canvas --workers 4
 ## Notes
 
 - "Canvas-hosted videos" means video files, Canvas media objects and Canvas Studio
-  (instructuremedia.com) embeds. Studio videos are fetched through the same LTI launch the
+  (instructuremedia.com) videos, whether embedded in a page or added as a module item. Studio videos are fetched through the same LTI launch the
   page's player uses, in the highest available quality, with their captions. Videos in other
   external tools (Panopto, Kaltura, YuJa, YouTube) aren't downloaded; their links appear in
   `_module.md` and `_external_links.md`.
